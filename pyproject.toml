@@ -1,0 +1,35 @@
+[project]
+name = "steganalysis-identifiability"
+version = "1.0.0"
+description = "Identifiability ceiling of content-adaptive steganography: transferable detection and the limits of algorithm attribution"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2,<3",
+    "scipy",
+    "scikit-learn",
+    "matplotlib",
+    "pillow",
+    "torch",
+    "conseal",
+    "jpeglib",
+    "liac-arff>=2.5.0",
+    "pycol-complexity>=1.0.4",
+]
+
+# This is a flat scripts repository, not an installable package: uv only manages the
+# environment and does not try to build/install the project itself.
+[tool.uv]
+package = false
+
+# jpeglib is installed from its GitHub repository: the PyPI sdist ships the libjpeg
+# C sources without their headers and fails to build. The repo includes the headers.
+# System prerequisite: libjpeg development headers (e.g. `apt install libjpeg-dev`).
+[tool.uv.sources]
+jpeglib = { git = "https://github.com/martinbenes1996/jpeglib.git" }
+torch = { index = "pytorch-cu128" }
+
+# CUDA 12.8 wheels (GPU). Drop this index (and use plain PyPI torch) for a CPU-only setup.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

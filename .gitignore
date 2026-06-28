@@ -1,0 +1,14 @@
+# virtual environment
+.venv/
+
+# python caches
+__pycache__/
+*.pyc
+
+# data / models / results (large or machine-specific; symlinked locally)
+data
+models
+results
+
+# archived superseded code (kept locally, not part of the repo)
+_legacy/
