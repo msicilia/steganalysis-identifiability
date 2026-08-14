@@ -1,0 +1,11 @@
+# virtual environment
+.venv/
+
+# python caches
+__pycache__/
+*.pyc
+
+# generated data, trained models and result logs (created by the pipeline; not versioned)
+data/
+models/
+results/
