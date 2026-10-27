@@ -1,36 +1,13 @@
-"""
-Central configuration for the steganalysis pipeline (detection and algorithm
-identification across the spatial and JPEG domains). All paths, hyperparameters and
-methodological choices live here.
-
-================================================================================
-VALIDITY NOTES (read before re-running)
-================================================================================
-[V1] IMAGE SIZE / RESIZING.
-     Resizing (bilinear interpolation) alters the steganographic signal (LSB and
-     DCT coefficients). Images are kept at their full 512x512 size; no resizing and
-     no cropping.
-
-[V2] COVER-SOURCE MISMATCH.
-     Cover/stego pairs come from the SAME source.
-
-[V3] STACKING LEAKAGE.
-     The ensemble meta-features are computed on images DISJOINT from those used to
-     train the specialists (out-of-fold).
-     See pt/build_ensemble.py / pt/build_gbras_ensemble.py.
-
-[V4] REPRODUCIBILITY.
-     A global seed is fixed and all hyperparameters are documented.
-================================================================================
+"""Central configuration: paths, payloads, class folders and training hyperparameters for the
+spatial and JPEG pipelines. The code refers to four validity notes:
+  [V1] images are used at 512x512, without resizing or cropping;
+  [V2] cover and stego come from the same source;
+  [V3] splits are disjoint by cover id; FUSION is halved by cover into a checkpoint-selection
+       half and a meta-learner half; TEST is never used for fitting or selection;
+  [V4] a global seed, per-image embedding seeds and best-effort deterministic cuDNN.
 """
 
 from pathlib import Path
-
-# ----------------------------------------------------------------------------
-# ACTIVE EXPERIMENT
-# ----------------------------------------------------------------------------
-# Label of the active experiment (spatial domain, single BOSSbase source).
-EXPERIMENT = "spatial_A"
 
 # ----------------------------------------------------------------------------
 # PAYLOAD SWEEP (bpp)
@@ -89,6 +66,9 @@ _D         = dirs_for(ACTIVE_ALPHA)
 TRAIN_DIR  = _D["train"]
 FUSION_DIR = _D["fusion"]
 VAL_DIR    = _D["fusion"]                   # alias for the validation/fusion split
+# [V3] Disjoint by-cover halves of FUSION (see data.fusion_subset_stems): checkpoint
+# selection on "select", stacking meta-learners on "meta".
+FUSION_SUBSETS = ("select", "meta")
 TEST_DIR   = _D["test"]
 
 # Model folder (separated per domain so JPEG models do not overwrite spatial ones).
@@ -126,8 +106,10 @@ SEED = 42
 # Class folders (stable order). Spatial: 5 adaptive schemes; JPEG: 4 adaptive + 1 legacy.
 if DOMAIN == "jpeg":
     CLASS_FOLDERS = ["COVER", "JUNIWARD", "UERD", "nsF5", "UED", "JMIPOD"]  # nsF5 = legacy; 4 adaptive
+    LEGACY_SCHEMES = ["nsF5"]      # non-adaptive; excluded from the adaptive-only analyses
 else:
     CLASS_FOLDERS = ["COVER", "HILL", "HUGO", "MiPOD", "S-UNIWARD", "WOW"]
+    LEGACY_SCHEMES = []
 COVER_NAME    = "COVER"
 
 # ----------------------------------------------------------------------------
@@ -136,10 +118,21 @@ COVER_NAME    = "COVER"
 LR          = 1e-3
 L2          = 1e-4
 DROPOUT     = 0.5
-EPOCHS_BIN  = 40     # binary detector (early stopping on val_auc)
+EPOCHS_BIN  = 80     # binary detector (early stopping on val_auc); 40 cut runs still improving
 EPOCHS_SPEC = 80     # specialist (early stopping)
-ES_PATIENCE = 7
-LR_PATIENCE = 3
+ES_PATIENCE = 8      # engine.train default (trainers may pass their own)
+# GBRAS-Net (train_gbras.py, train_gbras_wh.py). The original protocol trains a fixed number
+# of epochs and keeps the best checkpoint; patience 8 on its noisy block accuracy stopped
+# runs at epochs 17-51 while validation was still rising. None = no early stopping (the best
+# checkpoint on the FUSION "select" half is still kept); an int restores patience-based
+# stopping (e.g. 25) to cut GPU time. Override per run with --es-patience.
+GBRAS_EPOCHS      = 100
+GBRAS_ES_PATIENCE = None
+LR_PATIENCE = 4      # ReduceLROnPlateau patience (factor 0.5)
+# Early stopping may not stop a run before this many epochs (nor may the LR scheduler
+# decay before it): runs at low payload / no-SRM previously stopped at epochs 9-12
+# with best epoch 1-4 at chance, i.e. before learning had started.
+ES_MIN_EPOCHS = 15
 LABEL_SMOOTHING = 0.05
 
 # Enable class re-balancing.

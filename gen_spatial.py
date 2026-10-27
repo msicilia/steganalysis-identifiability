@@ -1,26 +1,13 @@
-"""
-Spatial-domain stego generation with conseal (pure Python). Single source (BOSSbase),
-same source for covers and stego [V2].
+"""Spatial stego generation with conseal: HILL, WOW, S-UNIWARD, MiPOD and HUGO at a given
+payload (bpp) for every BOSSbase cover.
 
-For each BOSSbase cover, generate its stego variant with HILL, WOW, S-UNIWARD, MiPOD
-and HUGO at the same payload (bpp). Output layout (class folders):
-
-    OUT_DIR/
-        COVER/      <- original cover (copied as lossless PNG)
-        HILL/
-        WOW/
-        S-UNIWARD/
-        MiPOD/
-
-CRITICAL:
-  * Saved as PNG (LOSSLESS). Saving as JPEG would destroy the LSB embedding.
-  * Same cover -> all its variants share content. To avoid train/test leakage by
-    content, make_splits.py must split by cover ID (not by individual image).
-  * Per-image seed for reproducibility [V4].
+Output: OUT_DIR/{COVER,HILL,WOW,S-UNIWARD,MiPOD,HUGO}/<id>.png (lossless PNG). Each
+embedding is seeded by the cover's position in the sorted cover list, so --limit or another
+cover folder changes the seeds. Existing valid PNGs are kept; truncated files are regenerated.
 
 Usage:
+    python gen_spatial.py --alpha 0.4
     python gen_spatial.py --limit 2000 --alpha 0.4
-    python gen_spatial.py                # all covers, default alpha
 """
 import argparse
 from pathlib import Path
@@ -50,12 +37,20 @@ def save_png(arr, path):
     Image.fromarray(np.squeeze(arr).astype(np.uint8), mode="L").save(path)
 
 
-def embed(fn, x0, alpha, seed):
-    """Simulate the embedding. Some simulators accept seed; fall back otherwise."""
+def _valid_png(path):
+    """True if `path` opens as a full 512x512 grayscale image (resume check)."""
     try:
-        x1 = fn(x0, alpha, seed=seed)
-    except TypeError:
-        x1 = fn(x0, alpha)   # in case a signature does not accept seed
+        with Image.open(path) as im:
+            im.load()                                   # forces a full decode
+            return im.mode == "L" and im.size == (512, 512)
+    except Exception:
+        return False
+
+
+def embed(fn, x0, alpha, seed):
+    """Simulate the embedding with a per-image seed. No unseeded fallback: a simulator
+    that rejects `seed` must fail loudly, not silently produce irreproducible stego."""
+    x1 = fn(x0, alpha, seed=seed)
     return np.squeeze(np.asarray(x1)).astype(np.uint8)
 
 
@@ -69,11 +64,17 @@ def generate(covers, out, alpha, algos, seed):
         stem = cover_path.stem
         x0 = load_pgm(cover_path)
         cover_out = out / COVER_CLASS / f"{stem}.png"      # lossless PNG
-        if not cover_out.exists():
+        if not _valid_png(cover_out):
             save_png(x0, cover_out)
         for name, fn in algos.items():
+            stego_out = out / name / f"{stem}.png"
+            if _valid_png(stego_out):
+                continue                                    # resumable: keep valid stego
+            # Seed depends on i = position in the FULL sorted cover list (not on the cover
+            # stem), so --limit / a different cover set shifts it. Kept as is: the existing
+            # spatial stego was verified bit-exact against this schedule and is reused.
             s = seed + i * 10 + algo_idx[name]              # deterministic seed
-            save_png(embed(fn, x0, alpha, s), out / name / f"{stem}.png")
+            save_png(embed(fn, x0, alpha, s), stego_out)
         if (i + 1) % 100 == 0:
             print(f"  [alpha={alpha}] {i+1}/{len(covers)} covers")
     print(f"[alpha={alpha}] done in {out}")
@@ -101,6 +102,12 @@ def main():
     covers = sorted(Path(args.covers).glob("*.pgm"))
     if args.limit:
         covers = covers[:args.limit]
+        # A prefix keeps positions (and seeds) of the kept covers, but the seed schedule is
+        # tied to the sorted list of THIS folder, so the result is only reproducible from
+        # the same cover folder -- worth saying out loud whenever the set is cut.
+        print(f"[warn] --limit {args.limit}: only the first {len(covers)} sorted covers; "
+              f"per-image seeds depend on each cover's position in the sorted cover list, "
+              f"so a different cover set/order gives different stego.", flush=True)
 
     # Sweep (--alphas) or a single payload (--alpha).
     alphas = [float(a) for a in args.alphas.split(",")] if args.alphas else [args.alpha]

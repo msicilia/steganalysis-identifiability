@@ -1,20 +1,25 @@
+"""PyTorch data loading for the spatial domain: full 512x512 greyscale images without
+rescaling, from the by-cover splits of make_splits.py. Uses PIL directly.
 """
-Data loading (PyTorch) for the spatial domain.
-
-  - FULL 512x512 image in GRAYSCALE, WITHOUT rescaling or cropping (rescaling
-    would alter the +-1 of the embedding).
-  - The train/fusion/test partitions are already DISJOINT by cover ID
-    (see make_splits.py); here they are only loaded.
-
-PIL is used directly (without torchvision) to avoid pinning versions on aarch64.
-"""
+import sys
 from pathlib import Path
 import numpy as np
 from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
 
+sys.path.append(str(Path(__file__).resolve().parent.parent))   # config lives in code/
+import config as C
+
 IMG_EXTS = ("*.png", "*.jpg", "*.jpeg")
+
+
+def _worker_init(worker_id):
+    """Give each DataLoader worker a seeded, distinct RNG stream. The datasets here read
+    deterministically, so this guards future changes rather than current behaviour."""
+    import random
+    seed = (torch.initial_seed() + worker_id) % (2 ** 32)
+    np.random.seed(seed); random.seed(seed)
 
 
 def list_images(folder):
@@ -34,6 +39,29 @@ def list_samples(split_dir, class_names):
         for p in list_images(split_dir / cls):
             items.append((str(p), idx))
     return items
+
+
+def fusion_subset_stems(split_dir, subset):
+    """Cover stems of one half of the FUSION split [V3]: 'select' (checkpoint selection) or
+    'meta' (stacking meta-learner training). Disjoint by cover, fixed by config.SEED, and
+    derived from the COVER folder, so every script and class gets the same halves."""
+    split_dir = Path(split_dir)
+    if split_dir.name != "fusion":
+        raise ValueError(f"fusion subsets apply only to the fusion split, got {split_dir}")
+    if subset not in C.FUSION_SUBSETS:
+        raise ValueError(f"subset must be one of {C.FUSION_SUBSETS}, got {subset!r}")
+    stems = sorted(p.stem for p in list_images(split_dir / C.COVER_NAME))
+    perm = np.random.default_rng(C.SEED).permutation(len(stems))
+    half = len(stems) // 2
+    return {stems[i] for i in (perm[:half] if subset == "select" else perm[half:])}
+
+
+def _in_subset(samples, split_dir, subset):
+    """Keep the (path, label) samples whose cover belongs to `subset` (None = all)."""
+    if subset is None:
+        return samples
+    keep = fusion_subset_stems(split_dir, subset)
+    return [s for s in samples if Path(s[0]).stem in keep]
 
 
 class StegoDataset(Dataset):
@@ -58,12 +86,12 @@ class StegoDataset(Dataset):
 
 
 def make_loader(split_dir, class_names, batch_size, *, binary_cover_idx=None,
-                shuffle=False, num_workers=8, limit_batches=None):
-    samples = list_samples(split_dir, class_names)
+                shuffle=False, num_workers=8, limit_batches=None, subset=None):
+    samples = _in_subset(list_samples(split_dir, class_names), split_dir, subset)
     ds = StegoDataset(samples, binary_cover_idx=binary_cover_idx)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
                         num_workers=num_workers, pin_memory=True,
-                        persistent_workers=(num_workers > 0), drop_last=False)
+                        persistent_workers=(num_workers > 0), worker_init_fn=_worker_init, drop_last=False)
     return loader
 
 
@@ -111,7 +139,7 @@ def make_dct_loader(split_dir, class_names, batch_size, *, binary_cover_idx=None
     ds = DCTDataset(samples, binary_cover_idx=binary_cover_idx)
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
                       num_workers=num_workers, pin_memory=True,
-                      persistent_workers=(num_workers > 0), drop_last=False)
+                      persistent_workers=(num_workers > 0), worker_init_fn=_worker_init, drop_last=False)
 
 
 # ---------------------------------------------------------------------------
@@ -135,32 +163,61 @@ class BlockDataset(Dataset):
 
 
 def make_block_loader(split_dir, cover_name, algo, batch_size, *, shuffle=False,
-                      num_workers=8):
+                      num_workers=8, subset=None):
     """COVER(0) vs `algo`(1) in 256 blocks."""
     split_dir = Path(split_dir)
     cov = [(str(p), 0) for p in list_images(split_dir / cover_name)]
     stg = [(str(p), 1) for p in list_images(split_dir / algo)]
-    ds = BlockDataset(cov + stg)
+    ds = BlockDataset(_in_subset(cov + stg, split_dir, subset))
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
                       num_workers=num_workers, pin_memory=True,
-                      persistent_workers=(num_workers > 0))
+                      persistent_workers=(num_workers > 0), worker_init_fn=_worker_init)
+
+
+class BalancedEpochSampler(torch.utils.data.Sampler):
+    """Cover-vs-all training sampler over a BlockDataset: every epoch yields the blocks of
+    ALL cover images plus a FRESH random subset of stego images of the same size (1:1),
+    shuffled at block level. Over the run the detector sees every stego image, while an
+    epoch costs the same as a fixed 1:1 subsample. The RNG advances each epoch (seeded)."""
+    def __init__(self, dataset, seed=0):
+        labels = np.array([y for _, y, _ in dataset.index[::4]])   # one label per image
+        self.cov = np.where(labels == 0)[0]
+        self.stg = np.where(labels == 1)[0]
+        self.n_stg = min(len(self.cov), len(self.stg))
+        self.rng = np.random.default_rng(seed)
+
+    def __len__(self):
+        return 4 * (len(self.cov) + self.n_stg)
+
+    def __iter__(self):
+        imgs = np.concatenate([self.cov, self.rng.choice(self.stg, self.n_stg, replace=False)])
+        blocks = (imgs[:, None] * 4 + np.arange(4)[None]).ravel()
+        return iter(self.rng.permutation(blocks).tolist())
 
 
 def make_block_loader_multi(split_dir, class_names, batch_size, *, binary_cover_idx=None,
-                            balance_binary=False, seed=0, shuffle=False, num_workers=8):
+                            balance_binary=False, resample_binary=False, seed=0,
+                            shuffle=False, num_workers=8, subset=None):
     """256 blocks with MULTICLASS label (index in class_names) or BINARY
     (binary_cover_idx → 0 cover / 1 stego). Stable order (4 consecutive blocks
     per image) if shuffle=False → allows aggregating per image afterwards.
 
     balance_binary: in binary mode (cover-vs-all), subsamples the stego (which
     has k× images, k=number of algorithms) to match the number of covers → 1:1.
-    Use only in TRAIN."""
+    The subset is drawn ONCE with default_rng(seed) and FIXED for the run; use it for the
+    selection (fusion) split, where a fixed set keeps the monitored metric comparable
+    across epochs. Never for TEST.
+
+    resample_binary: for TRAIN in binary mode. Keeps all images and draws a fresh 1:1
+    stego subset every epoch (BalancedEpochSampler), so no stego image is left unseen;
+    implies shuffling."""
     split_dir = Path(split_dir)
     samples = []
     for idx, cls in enumerate(class_names):
         lbl = idx if binary_cover_idx is None else (0 if idx == binary_cover_idx else 1)
         for p in list_images(split_dir / cls):
             samples.append((str(p), lbl))
+    samples = _in_subset(samples, split_dir, subset)      # before balancing
     if balance_binary and binary_cover_idx is not None:
         cov = [s for s in samples if s[1] == 0]
         stg = [s for s in samples if s[1] == 1]
@@ -170,6 +227,12 @@ def make_block_loader_multi(split_dir, class_names, batch_size, *, binary_cover_
             stg = [stg[i] for i in keep]
         samples = cov + stg
     ds = BlockDataset(samples)
+    if resample_binary:
+        if binary_cover_idx is None or balance_binary:
+            raise ValueError("resample_binary needs binary mode and excludes balance_binary")
+        return DataLoader(ds, batch_size=batch_size, sampler=BalancedEpochSampler(ds, seed),
+                          num_workers=num_workers, pin_memory=True,
+                          persistent_workers=(num_workers > 0), worker_init_fn=_worker_init)
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
                       num_workers=num_workers, pin_memory=True,
-                      persistent_workers=(num_workers > 0))
+                      persistent_workers=(num_workers > 0), worker_init_fn=_worker_init)

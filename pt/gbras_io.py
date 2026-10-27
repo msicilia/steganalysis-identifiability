@@ -1,8 +1,5 @@
-"""
-Utilities for using GBRAS-Net as a spatial detector: inference and
-PER-IMAGE AGGREGATED features (GBRAS works on 4 blocks of 256 per image; the 4
-are averaged). Requires loaders with shuffle=False (stable order, 4 consecutive
-blocks per image).
+"""GBRAS-Net inference helpers: per-image scores and features from the four 256x256 blocks of
+each image (loaders must not shuffle).
 """
 import numpy as np
 import torch
@@ -31,13 +28,14 @@ def per_image_probs(model, block_loader, device):
 
 @torch.no_grad()
 def per_image_feats(model, block_loader, device):
-    """Penultimate GBRAS features (output of bn11, 30-d) with GAP, per image."""
+    """Penultimate GBRAS features (output of bn11, 30-d, exactly what c8 receives) with
+    GAP, per image."""
     box = {}
     h = model.bn11.register_forward_hook(lambda m, i, o: box.__setitem__("f", o))
     Fs, Y = [], []
     for xb, yb in block_loader:
         model(xb.to(device))
-        g = F.adaptive_avg_pool2d(F.elu(box["f"]), 1).flatten(1).cpu().numpy()
+        g = F.adaptive_avg_pool2d(box["f"], 1).flatten(1).cpu().numpy()
         Fs.append(g); Y.append(np.asarray(yb))
     h.remove()
     Fs = np.concatenate(Fs); Y = np.concatenate(Y)

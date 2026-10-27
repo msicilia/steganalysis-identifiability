@@ -9,6 +9,7 @@ __pycache__/
 data
 models
 results
+logs/
 
 # archived superseded code (kept locally, not part of the repo)
 _legacy/

@@ -1,16 +1,6 @@
-"""
-PyTorch port of the steganalysis models (GB10 GPU; TF has no aarch64 GPU wheel).
-
-Models:
-  - SRM residual front-end (fixed high-pass 5x5 kernels + TLU clip): amplifies
-    the +-1 of the embedding.
-  - BinaryCNN  (expert A): cover/stego detector, 1 logit.
-  - SpecialistCNN (expert C / family): backbone + GAP->Dense, softmax.
-  - GBRASNet: 30 official SRM kernels + Tanh3 + separable blocks.
-  - MetaMLP: fuses the experts' posteriors (level 2).
-
-Design: full 512x512 image in GRAYSCALE, WITHOUT rescaling. With SRM there is NO /255
-division (the filters operate on the pixel values; BatchNorm normalizes the scale).
+"""PyTorch models: SRM residual front end (fixed 5x5 high-pass kernels + TLU), BinaryCNN
+(cover/stego), SpecialistCNN (multiclass), GBRASNet (30 SRM kernels, Tanh3, separable
+blocks) and MetaMLP. Inputs are full 512x512 greyscale images without rescaling or /255.
 """
 from pathlib import Path
 import numpy as np
@@ -147,8 +137,10 @@ def tanh3(x):
 
 
 def _bn(ch):
-    # GBRAS uses low momentum and scale=False; in torch BN, "scale=False" -> affine weight=1 fixed.
-    m = nn.BatchNorm2d(ch, momentum=0.2, eps=1e-3, affine=True)
+    # Original Keras: BatchNormalization(momentum=0.2, epsilon=0.001, center=True, scale=False).
+    # Keras momentum weights the OLD running stat, torch momentum weights the NEW batch
+    # stat, so Keras 0.2 == torch 0.8. "scale=False" -> affine weight fixed at 1.
+    m = nn.BatchNorm2d(ch, momentum=0.8, eps=1e-3, affine=True)
     nn.init.ones_(m.weight); m.weight.requires_grad_(False)   # center=True, scale=False
     return m
 

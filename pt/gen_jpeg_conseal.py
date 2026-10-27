@@ -1,12 +1,8 @@
-"""JPEG stego generation with conseal reference costs (J-UNIWARD, UERD, nsF5).
-Reuses the SAME existing Q75 covers (DATA_JPEG_q75_aXXX/COVER/*.jpg) and writes the
-stego into the JUNIWARD/UERD/nsF5 folders with jpeglib. UED and J-MiPOD are not in
-conseal and are generated separately with jpeg_embedders.py.
+"""JPEG stego with the conseal costs and simulator (J-UNIWARD, UERD, nsF5) on the existing Q75
+covers; writes the JUNIWARD/UERD/nsF5 folders with jpeg_embedders.write_jpeg. Seeds are per
+(cover, scheme, payload); existing files are skipped.
 
-Payload convention: bpnzAC (same as the rest). Seed = int(stem) (reproducible, same as
-the local simulators). Resumable: skips stego already written.
-
-Usage:  ../../.venv_conseal/bin/python gen_jpeg_conseal.py --alphas 0.1,0.2,0.4 --limit 2000
+Usage:  STEG_DOMAIN=jpeg uv run python pt/gen_jpeg_conseal.py --alphas 0.1,0.2,0.4
 """
 import argparse
 import sys
@@ -16,6 +12,7 @@ import jpeglib
 import conseal as cl
 sys.path.append(str(Path(__file__).resolve().parent.parent))   # code/ (config.py)
 import config as C
+from jpeg_embedders import embed_seed, write_jpeg, claim_dataset_root
 
 # folder name -> conseal reference simulator
 SCHEMES = ("JUNIWARD", "UERD", "nsF5")
@@ -47,7 +44,12 @@ def embed_one(name, Y0, qt, sp, alpha, seed):
 
 def gen_for_alpha(alpha, limit, schemes):
     root = C.data_root(alpha)                       # DATA_JPEG_q75_aXXX
+    claim_dataset_root(root, create=False)          # must come from this code's gen_jpeg.py
     covers = sorted((root / "COVER").glob("*.jpg"))[:limit]
+    if not covers:
+        sys.exit(f"[alpha={alpha}] no covers in {root / 'COVER'}: covers are created only "
+                 f"by gen_jpeg.py -- run `gen_jpeg.py --embedders UED,JMIPOD --alphas "
+                 f"{alpha}` first.")
     for s in schemes:
         (root / s).mkdir(parents=True, exist_ok=True)
     print(f"[alpha={alpha}] covers={len(covers)} -> {root.name} | conseal={list(schemes)}", flush=True)
@@ -56,14 +58,13 @@ def gen_for_alpha(alpha, limit, schemes):
         todo = [s for s in schemes if not (root / s / f"{stem}.jpg").exists()]
         if not todo:
             continue
-        seed = int(stem) if stem.isdigit() else (abs(hash(stem)) % (2**31))
         im = jpeglib.read_dct(str(cov))
         Y0 = im.Y.copy(); qt = im.qt[0]
         sp = jpeglib.read_spatial(str(cov)).spatial[:, :, 0].astype(np.float64)
         for s in todo:
-            ys = embed_one(s, Y0, qt, sp, alpha, seed)
+            ys = embed_one(s, Y0, qt, sp, alpha, embed_seed(stem, s, alpha))
             im.Y = ys
-            im.write_dct(str(root / s / f"{stem}.jpg"))
+            write_jpeg(im, root / s / f"{stem}.jpg")
         if (i + 1) % 200 == 0:
             print(f"  [alpha={alpha}] {i+1}/{len(covers)}", flush=True)
     print(f"[alpha={alpha}] done", flush=True)
@@ -73,7 +74,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--alpha", type=float, default=None)
     ap.add_argument("--alphas", default=None, help="list e.g. 0.1,0.2,0.4")
-    ap.add_argument("--limit", type=int, default=2000)
+    ap.add_argument("--limit", type=int, default=None, help="number of covers (default: all)")
     ap.add_argument("--schemes", default=",".join(SCHEMES))
     args = ap.parse_args()
     assert C.DOMAIN == "jpeg", "Run with STEG_DOMAIN=jpeg"

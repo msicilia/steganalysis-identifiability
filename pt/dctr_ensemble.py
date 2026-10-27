@@ -1,108 +1,117 @@
+"""JPEG/DCTR single split: cover-vs-all detection, cover-vs-one specialists, the monolithic
+six-class classifier and the modular stacking ensemble, all with logistic regression.
+fit_base() and evaluate() are reused by dctr_bootstrap.py, which run_all.sh calls instead of
+this script.
+
+Usage:  STEG_DOMAIN=jpeg python dctr_ensemble.py --alpha 0.4
 """
-JPEG (DCT domain, DCTR features): compare a modular ensemble against a monolithic
-classifier.
-
-On the DCTR features (extract_dctr.py), with linear classifiers (LogReg):
-
-  A) Binary COVER vs any stego detection (AUC/P_D/P_FA).
-  B) COVER-vs-each-algorithm specialists (standalone AUC).
-  C) Monolithic multiclass classifier.
-  D) Modular ensemble (meta-LogReg over specialist posteriors),
-     leak-free: specialists on TRAIN, meta-features on FUSION, evaluation on TEST.
-  E) Separability (multiclass and pairwise Fisher J) over DCTR.
-
-Reports Δacc(modular − monolithic). Usage:
-  STEG_DOMAIN=jpeg python dctr_ensemble.py --alpha 0.4
-"""
-import sys, argparse, json, itertools
+import sys, argparse, json
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, confusion_matrix, f1_score, accuracy_score
 import config as C
-from util import load_dctr, fisher_J
+from util import load_dctr, fit_logreg, convergence_info
+
+SPLITS = ("train", "fusion", "test")
+
+
+def load_scaled(alpha):
+    """DCTR features standardised with a scaler fitted on TRAIN, and their labels."""
+    X, y = load_dctr(alpha)
+    sc = StandardScaler().fit(X["train"])
+    return {s: sc.transform(X[s]) for s in SPLITS}, y
+
+
+def fit_base(X, y, names):
+    """Every single-split LogReg fit, once. Every fit goes through util.fit_logreg, which
+    escalates the iteration budget until lbfgs converges and raises rather than returning a
+    truncated fit."""
+    cov = names.index(C.COVER_NAME)
+    algos = [c for c in names if c != C.COVER_NAME]
+    Xtr, ytr = X["train"], y["train"]
+    det = fit_logreg(Xtr, (ytr != cov).astype(int), tag="detect")
+    spec = {}
+    for a in algos:
+        ai = names.index(a)
+        m = (ytr == cov) | (ytr == ai)
+        spec[a] = fit_logreg(Xtr[m], (ytr[m] == ai).astype(int), tag=f"spec:{a}")
+    mono = fit_logreg(Xtr, ytr, tag="mono")
+    # leak-free stacking: the meta-learner trains on the specialists' FUSION posteriors
+    Pfu = np.column_stack([spec[a].predict_proba(X["fusion"])[:, 1] for a in algos])
+    meta = fit_logreg(Pfu, y["fusion"], tag="meta")
+    return {"det": det, "spec": spec, "mono": mono, "meta": meta, "Pfu": Pfu}
+
+
+def evaluate(base, X, y, names):
+    """TEST predictions of every base model, and the dctr_ensemble report."""
+    cov = names.index(C.COVER_NAME)
+    algos = [c for c in names if c != C.COVER_NAME]
+    Xte, yte = X["test"], y["test"]
+
+    # A) binary detection
+    sdet = base["det"].predict_proba(Xte)[:, 1]
+    ybt = (yte != cov).astype(int)
+    tn, fp, fn, tp = confusion_matrix(ybt, (sdet >= 0.5).astype(int), labels=[0, 1]).ravel()
+    detection = {"auc": float(roc_auc_score(ybt, sdet)),
+                 "P_D": float(tp/(tp+fn)), "P_FA": float(fp/(fp+tn))}
+
+    # B) specialists: posteriors on all test rows (modular arm) and cover-vs-own-scheme AUC
+    Pte = np.column_stack([base["spec"][a].predict_proba(Xte)[:, 1] for a in algos])
+    spec_auc = {}
+    for k, a in enumerate(algos):
+        ai = names.index(a)
+        mt = (yte == cov) | (yte == ai)
+        spec_auc[a] = float(roc_auc_score((yte[mt] == ai).astype(int), Pte[mt, k]))
+
+    # C) monolithic multiclass, D) modular ensemble
+    mono_pred = base["mono"].predict(Xte)
+    mod_pred = base["meta"].predict(Pte)
+
+    def mc(pred):
+        return {"acc": float(accuracy_score(yte, pred)),
+                "macro_f1": float(f1_score(yte, pred, average="macro")),
+                "cm": confusion_matrix(yte, pred, labels=range(len(names))).tolist()}
+    report = {"detection": detection, "specialist_auc": spec_auc,
+              "monolithic": mc(mono_pred), "modular": mc(mod_pred)}
+    preds = {"det": sdet, "Pte": Pte, "mono": mono_pred, "modular": mod_pred}
+    return preds, report
+
+
+def write_report(alpha, names, report):
+    # Separability (Fisher J) is deliberately not recomputed here: jpeg_kfold_cv.py reports
+    # the pairwise Fisher J on a PCA-50 (fitted on all rows, descriptive) and
+    # dctr_bootstrap.py the multiclass/pairwise J on a train-fitted PCA-50.
+    out = {"alpha": alpha, "classes": names, **report, "provenance": convergence_info()}
+    res = C.RESULTS_DIR; res.mkdir(parents=True, exist_ok=True)
+    dst = res / f"dctr_ensemble_{C.alpha_tag(alpha)}.json"
+    dst.write_text(json.dumps(out, indent=2))
+
+    det = report["detection"]
+    print(f"\n### A) COVER/stego detection (DCTR): AUC={det['auc']:.4f} "
+          f"P_D={det['P_D']:.4f} P_FA={det['P_FA']:.4f}")
+    print("### B) COVER-vs-algo specialists (test AUC):")
+    for a, v in report["specialist_auc"].items():
+        print(f"   {a}: {v:.4f}")
+    r_mono, r_ens = report["monolithic"], report["modular"]
+    print(f"### C) Monolithic multiclass : acc={r_mono['acc']:.4f} macroF1={r_mono['macro_f1']:.4f}")
+    print(f"### D) Modular   multiclass : acc={r_ens['acc']:.4f} macroF1={r_ens['macro_f1']:.4f}")
+    print(f"\n>>> Δacc modular−monolithic = {r_ens['acc'] - r_mono['acc']:+.4f}")
+    print("saved:", dst)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--alpha", type=float, default=0.4)
-    ap.add_argument("--Creg", type=float, default=1.0)
     args = ap.parse_args()
-    names = C.CLASS_FOLDERS; cov = names.index(C.COVER_NAME)
-    algos = [c for c in names if c != C.COVER_NAME]
-    X, y = load_dctr(args.alpha)
-    sc = StandardScaler().fit(X["train"])
-    Xtr, Xfu, Xte = (sc.transform(X[s]) for s in ("train", "fusion", "test"))
-    ytr, yfu, yte = y["train"], y["fusion"], y["test"]
-    ybin = {s: (y[s] != cov).astype(int) for s in ("train", "fusion", "test")}
-    print(f"== DCTR ensemble | alpha={args.alpha} | feat={Xtr.shape[1]} | classes={names}")
-
-    def lr():
-        return LogisticRegression(C=args.Creg, max_iter=3000, class_weight="balanced")
-
-    # A) binary detection
-    detb = lr().fit(Xtr, ybin["train"]); sdet = detb.predict_proba(Xte)[:, 1]
-    pdet = (sdet >= 0.5).astype(int)
-    tn, fp, fn, tp = confusion_matrix(ybin["test"], pdet, labels=[0, 1]).ravel()
-    detection = {"auc": float(roc_auc_score(ybin["test"], sdet)),
-                 "P_D": float(tp/(tp+fn)), "P_FA": float(fp/(fp+tn))}
-
-    # B) COVER-vs-algo specialists + posteriors (leak-free) for the ensemble
-    spec, spec_auc = {}, {}
-    Pfu = np.zeros((len(yfu), len(algos))); Pte = np.zeros((len(yte), len(algos)))
-    for k, a in enumerate(algos):
-        ai = names.index(a)
-        m = (ytr == cov) | (ytr == ai)
-        clf = lr().fit(Xtr[m], (ytr[m] == ai).astype(int))
-        spec[a] = clf
-        Pfu[:, k] = clf.predict_proba(Xfu)[:, 1]
-        Pte[:, k] = clf.predict_proba(Xte)[:, 1]
-        # specialist AUC on test cover-vs-its-algo
-        mt = (yte == cov) | (yte == ai)
-        spec_auc[a] = float(roc_auc_score((yte[mt] == ai).astype(int),
-                                          clf.predict_proba(Xte[mt])[:, 1]))
-
-    # C) monolithic multiclass
-    mono = lr().fit(Xtr, ytr); pmono = mono.predict(Xte)
-    r_mono = {"acc": float(accuracy_score(yte, pmono)),
-              "macro_f1": float(f1_score(yte, pmono, average="macro")),
-              "cm": confusion_matrix(yte, pmono, labels=range(len(names))).tolist()}
-
-    # D) 4-class modular ensemble (meta over posteriors, leak-free: fit on FUSION)
-    meta = lr().fit(Pfu, yfu); pens = meta.predict(Pte)
-    r_ens = {"acc": float(accuracy_score(yte, pens)),
-             "macro_f1": float(f1_score(yte, pens, average="macro")),
-             "cm": confusion_matrix(yte, pens, labels=range(len(names))).tolist()}
-
-    # E) separability over DCTR (4 classes and pairwise) - subsample dims for cost
-    sub = np.random.default_rng(0).choice(Xtr.shape[1], min(2000, Xtr.shape[1]), replace=False)
-    Xs = Xte[:, sub]
-    J4 = fisher_J(Xs, yte)
-    pair = {}
-    for a, b in itertools.combinations(range(len(names)), 2):
-        m = (yte == a) | (yte == b)
-        pair[f"{names[a]}|{names[b]}"] = round(fisher_J(Xs[m], yte[m]), 3)
-
-    out = {"alpha": args.alpha, "classes": names, "detection": detection,
-           "specialist_auc": spec_auc, "monolithic": r_mono, "modular": r_ens,
-           "fisher_J_4class": J4, "fisher_pairs": pair}
-    res = C.RESULTS_DIR; res.mkdir(parents=True, exist_ok=True)
-    (res / f"dctr_ensemble_{C.alpha_tag(args.alpha)}.json").write_text(json.dumps(out, indent=2))
-
-    print(f"\n### A) COVER/stego detection (DCTR): AUC={detection['auc']:.4f} "
-          f"P_D={detection['P_D']:.4f} P_FA={detection['P_FA']:.4f}")
-    print("### B) COVER-vs-algo specialists (test AUC):")
-    for a in algos: print(f"   {a}: {spec_auc[a]:.4f}")
-    print(f"### C) Monolithic multiclass : acc={r_mono['acc']:.4f} macroF1={r_mono['macro_f1']:.4f}")
-    print(f"### D) Modular   multiclass : acc={r_ens['acc']:.4f} macroF1={r_ens['macro_f1']:.4f}")
-    dacc = r_ens["acc"] - r_mono["acc"]
-    print(f"\n>>> Δacc modular−monolithic = {dacc:+.4f}")
-    print(f"### E) Fisher J multiclass (DCTR) = {J4:.3f}")
-    print("   pairs:", pair)
-    print("saved:", res / f"dctr_ensemble_{C.alpha_tag(args.alpha)}.json")
+    names = C.CLASS_FOLDERS
+    X, y = load_scaled(args.alpha)
+    print(f"== DCTR ensemble | alpha={args.alpha} | feat={X['train'].shape[1]} | classes={names}")
+    base = fit_base(X, y, names)
+    _, report = evaluate(base, X, y, names)
+    write_report(args.alpha, names, report)
 
 
 if __name__ == "__main__":

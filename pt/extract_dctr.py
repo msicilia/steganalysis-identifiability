@@ -1,29 +1,49 @@
-"""
-DCTR feature extraction (Holub & Fridrich, 2015) for JPEG steganalysis.
-A content-invariant feature representer based on coefficient statistics.
-
-Idea: decompress the JPEG to spatial (PIL, no torchjpeg) -> convolve with the
-64 base DCT 8x8 filters (undecimated DCT) -> per filter and per PHASE (position mod 8),
-histogram of |residual| quantized (step q) and truncated (threshold T). The phase is key:
-the JPEG 8x8 grid creates phase-dependent statistics.
-
-Dim per image: 64 filters x 64 phases x (T+1) bins. Matrices are saved per split.
-Convolutions on GPU (torch) for speed; does NOT use torchjpeg.
+"""DCTR features (Holub and Fridrich, 2015) for the JPEG splits: unrounded decompression, the
+64 DCT basis filters, per-filter and per-phase histograms with step q and threshold T. Phases
+are kept separate (64 x 64 x (T+1) = 20,480 features at T=4). Matrices are saved per split;
+convolutions run on the GPU.
 
 Usage:  STEG_DOMAIN=jpeg python extract_dctr.py --alpha 0.4 --q 4 --T 4
 """
-import sys, argparse
+import sys, argparse, json
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+import jpeglib
+from scipy.fft import idctn
 
 import config as C
 from data import list_images
 from engine import DEVICE
+
+
+# DCTR quantisation step and truncation threshold. Defined once here; every other
+# script imports these rather than repeating the literals.
+DCTR_Q = 4.0      # = DCTR.m's q = 8*(2 - QF/50) at QF 75
+DCTR_T = 4
+DECOMPRESSION = "unrounded: block IDCT of dequantised coefficients + 128 (as DCTR.m)"
+
+
+def decompress_unrounded(path):
+    """Spatial image of a grayscale JPEG WITHOUT rounding or clipping, float32 (H, W): the
+    orthonormal block IDCT of the dequantised coefficients + 128, exactly what the reference
+    DCTR.m filters. Decoding through a JPEG library instead returns uint8 pixels, rounded and
+    clipped, which discards part of the coefficient change the features exist to see.
+    (Rounded and clipped, this matches libjpeg's decode to within 1 grey level.)"""
+    im = jpeglib.read_dct(str(path))
+    Y = im.Y.astype(np.float64)
+    q = im.qt[im.quant_tbl_no[0]].astype(np.float64)
+    Hb, Wb = Y.shape[:2]
+    blocks = idctn(Y * q[None, None], axes=(2, 3), norm="ortho") + 128.0
+    return blocks.transpose(0, 2, 1, 3).reshape(Hb * 8, Wb * 8).astype(np.float32)
+
+
+def load_batch(paths, device):
+    """(B,1,H,W) float tensor of unrounded decompressed JPEGs, for dctr_features_batch."""
+    return torch.stack([torch.from_numpy(decompress_unrounded(p)) for p in paths])[:, None].to(device)
 
 
 def dct_basis_filters():
@@ -59,8 +79,8 @@ def dctr_features_batch(imgs, W, q, T):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--alpha", type=float, default=0.4)
-    ap.add_argument("--q", type=float, default=4.0)
-    ap.add_argument("--T", type=int, default=4)
+    ap.add_argument("--q", type=float, default=DCTR_Q)
+    ap.add_argument("--T", type=int, default=DCTR_T)
     ap.add_argument("--bs", type=int, default=64)
     args = ap.parse_args()
     assert C.DOMAIN == "jpeg", "Run with STEG_DOMAIN=jpeg"
@@ -79,13 +99,21 @@ def main():
         X = np.zeros((len(paths), 64*64*(args.T+1)), np.float32)
         for s in range(0, len(paths), args.bs):
             batch = paths[s:s+args.bs]
-            imgs = torch.stack([
-                torch.from_numpy(np.asarray(Image.open(p).convert("L"), np.float32))
-                for p in batch])[:, None].to(DEVICE)
-            X[s:s+len(batch)] = dctr_features_batch(imgs, W, args.q, args.T)
+            X[s:s+len(batch)] = dctr_features_batch(load_batch(batch, DEVICE), W, args.q, args.T)
         y = np.array(labels, np.int64)
+        # Cover id per row: a cover and its stego variants share the file stem, and every
+        # confidence interval downstream has to resample covers rather than images.
+        g = np.array([p.stem for p in paths])
         np.save(dst / f"X_{split}.npy", X); np.save(dst / f"y_{split}.npy", y)
-        print(f"  {split}: X={X.shape} classes={np.bincount(y).tolist()}")
+        np.save(dst / f"g_{split}.npy", g)
+        print(f"  {split}: X={X.shape} classes={np.bincount(y).tolist()} "
+              f"covers={len(np.unique(g))}")
+    # The quantisation/truncation settings are part of the feature definition: record them
+    # so a cache can never be silently paired with a different (q, T).
+    (dst / "params.json").write_text(json.dumps({"q": args.q, "T": args.T,
+                                                 "dim": 64*64*(args.T+1),
+                                                 "variant": "unmerged 64 phases",
+                                                 "decompression": DECOMPRESSION}, indent=2))
     print("done:", dst)
 
 
